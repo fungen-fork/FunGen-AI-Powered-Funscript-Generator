@@ -22,6 +22,7 @@ from application.utils.timeline_modes import TimelineMode, TimelineInteractionSt
 from application.utils.bpm_analyzer import BPMOverlayConfig, TapTempo, SUBDIVISION_LABELS, SUBDIVISION_VALUES
 from application.classes.bookmark_manager import BookmarkManager
 from application.classes.recording_capture import RecordingCapture
+from funscript.learning.correction_journal import CorrectionJournal, CorrectionEntry
 
 class TimelineTransformer:
     """
@@ -173,6 +174,13 @@ class InteractiveFunscriptTimeline:
         self._calibration = None             # CalibrationRoutine when active
         self._show_controller_settings: bool = False
 
+        # Learning Mode — correction capture & suggestion overlay
+        self.learning_suggestion_actions: Optional[List[Dict]] = None
+        self.learning_suggestions: Optional[List[Dict]] = None  # Raw suggestion metadata
+        self.show_learning_suggestions: bool = True
+        self._correction_journal: Optional[CorrectionJournal] = None
+        self._drag_before_state: Optional[Dict] = None  # Captures point state before drag
+
         # BPM/Tempo Overlay
         self._bpm_config: Optional[BPMOverlayConfig] = None
         self._tap_tempo = TapTempo()
@@ -308,6 +316,12 @@ class InteractiveFunscriptTimeline:
              self._draw_curve(draw_list, tf, self.ultimate_autotune_preview_actions,
                               color_override=TimelineColors.ULTIMATE_AUTOTUNE_PREVIEW,
                               force_lines_only=True, alpha=0.7)
+
+        # 6a-2. Draw Learning Suggestion Overlay (if enabled)
+        if self.show_learning_suggestions and self.learning_suggestion_actions:
+            self._draw_curve(draw_list, tf, self.learning_suggestion_actions,
+                             color_override=TimelineColors.LEARNING_SUGGESTION,
+                             force_lines_only=True, alpha=0.6)
 
         # 6b. Draw Active Plugin Preview (if any)
         if self.is_previewing and self.preview_actions:
@@ -752,6 +766,8 @@ class InteractiveFunscriptTimeline:
         if not self.drag_undo_recorded:
             self.app.funscript_processor._record_timeline_action(self.timeline_num, "Drag Point")
             self.drag_undo_recorded = True
+            # Capture before-state for learning correction journal
+            self._drag_before_state = {'at': actions[self.dragging_action_idx]['at'], 'pos': actions[self.dragging_action_idx]['pos']}
 
         # Calculate New Values
         t_raw = tf.x_to_time(mouse_pos[0])
@@ -773,14 +789,27 @@ class InteractiveFunscriptTimeline:
         # Apply
         actions[idx]['at'] = new_t
         actions[idx]['pos'] = new_v
-        
+
         # Update state
+        fs, axis = self._get_target_funscript_details()
+        if fs:
+            fs._invalidate_cache(axis or 'both')
         self.invalidate_cache()
         self.app.project_manager.project_dirty = True
 
     def _finalize_drag(self):
         if self.drag_undo_recorded:
              self.app.funscript_processor._finalize_action_and_update_ui(self.timeline_num, "Drag Point")
+             # Record move correction for learning
+             if self._drag_before_state and self.dragging_action_idx >= 0:
+                 actions = self._get_actions()
+                 if self.dragging_action_idx < len(actions):
+                     after = actions[self.dragging_action_idx]
+                     if after['pos'] != self._drag_before_state['pos'] or after['at'] != self._drag_before_state['at']:
+                         self._record_learning_correction("move",
+                             original=self._drag_before_state,
+                             corrected={'at': after['at'], 'pos': after['pos']})
+             self._drag_before_state = None
 
     def _finalize_marquee(self, tf, actions, append: bool):
         if not self.marquee_start or not self.marquee_end: return
@@ -871,14 +900,17 @@ class InteractiveFunscriptTimeline:
     def _nudge_selection_value(self, delta: int):
         actions = self._get_actions()
         if not actions: return
-        
+
         snap = self.app.app_state_ui.snap_to_grid_pos
         actual_delta = delta * (snap if snap > 0 else 1)
-        
+
         self.app.funscript_processor._record_timeline_action(self.timeline_num, "Nudge Value")
         for idx in self.multi_selected_action_indices:
             if idx < len(actions):
                 actions[idx]['pos'] = max(0, min(100, actions[idx]['pos'] + actual_delta))
+        fs, axis = self._get_target_funscript_details()
+        if fs:
+            fs._invalidate_cache(axis or 'both')
         self.app.funscript_processor._finalize_action_and_update_ui(self.timeline_num, "Nudge Value")
         self.invalidate_cache()
 
@@ -900,6 +932,9 @@ class InteractiveFunscriptTimeline:
                 new_at = actions[idx]['at'] + delta_ms
                 actions[idx]['at'] = int(max(prev_limit, min(next_limit, new_at)))
 
+        fs, axis = self._get_target_funscript_details()
+        if fs:
+            fs._invalidate_cache(axis or 'both')
         self.app.funscript_processor._finalize_action_and_update_ui(self.timeline_num, "Nudge Time")
         self.invalidate_cache()
 
@@ -2414,6 +2449,22 @@ class InteractiveFunscriptTimeline:
                     self._bookmark_manager.clear()
                     imgui.close_current_popup()
 
+            # --- Learning Suggestions ---
+            if self.learning_suggestion_actions:
+                imgui.separator()
+                if imgui.menu_item("Accept All Suggestions")[0]:
+                    self._accept_all_learning_suggestions()
+                    imgui.close_current_popup()
+                if imgui.menu_item("Dismiss Suggestions")[0]:
+                    self.learning_suggestion_actions = None
+                    self.learning_suggestions = None
+                    imgui.close_current_popup()
+
+            toggle_label = "Hide Learning Suggestions" if self.show_learning_suggestions else "Show Learning Suggestions"
+            if imgui.menu_item(toggle_label)[0]:
+                self.show_learning_suggestions = not self.show_learning_suggestions
+                imgui.close_current_popup()
+
             # --- Pattern Library (Patreon) ---
             if _is_feature_available("patreon_features"):
                 imgui.separator()
@@ -2599,6 +2650,8 @@ class InteractiveFunscriptTimeline:
         fs.add_action(t, v if axis=='primary' else None, v if axis=='secondary' else None)
         self.app.funscript_processor._finalize_action_and_update_ui(self.timeline_num, "Add Point")
         self.invalidate_cache()
+        # Record add correction for learning
+        self._record_learning_correction("add", corrected={'at': t, 'pos': v})
 
     def _delete_selected(self):
         if not self.multi_selected_action_indices:
@@ -2609,12 +2662,20 @@ class InteractiveFunscriptTimeline:
             self.logger.error(f"Could not get funscript details for timeline {self.timeline_num}")
             return
 
+        # Capture deleted points before deletion for learning
+        actions = self._get_actions()
+        deleted_points = [{'at': actions[i]['at'], 'pos': actions[i]['pos']}
+                          for i in sorted(self.multi_selected_action_indices) if i < len(actions)]
+
         self.app.funscript_processor._record_timeline_action(self.timeline_num, "Delete Points")
         fs.clear_points(axis=axis, selected_indices=list(self.multi_selected_action_indices))
         self.multi_selected_action_indices.clear()
         self.selected_action_idx = -1
         self.app.funscript_processor._finalize_action_and_update_ui(self.timeline_num, "Delete Points")
         self.invalidate_cache()
+        # Record delete correction for learning
+        if deleted_points:
+            self._record_learning_correction("delete", deleted_points=deleted_points)
 
     def _clear_all_points(self):
         """Delete all points on this timeline (undoable)."""
@@ -2719,9 +2780,123 @@ class InteractiveFunscriptTimeline:
         return " | ".join(parts)
 
     # ==================================================================================
+    # LEARNING MODE — CORRECTION CAPTURE & SUGGESTIONS
+    # ==================================================================================
+
+    def _get_correction_journal(self) -> Optional[CorrectionJournal]:
+        """Get or create correction journal for current project."""
+        if self._correction_journal is not None:
+            return self._correction_journal
+        # Try to get from project manager
+        pm = getattr(self.app, 'project_manager', None)
+        if pm:
+            journal = getattr(pm, '_correction_journal', None)
+            if journal:
+                self._correction_journal = journal
+                return journal
+        return None
+
+    def set_correction_journal(self, journal: CorrectionJournal):
+        """Set the correction journal (called by project manager on load/create)."""
+        self._correction_journal = journal
+
+    def _get_chapter_type_at_time(self, at_ms: int) -> str:
+        """Look up chapter type for a timestamp from video chapters."""
+        fs_proc = getattr(self.app, 'funscript_processor', None)
+        if not fs_proc:
+            return "unknown"
+        chapters = getattr(fs_proc, '_video_chapters', None)
+        if not chapters:
+            return "unknown"
+        for ch in chapters:
+            start = ch.get('start_ms', ch.get('start_time_ms', 0))
+            end = ch.get('end_ms', ch.get('end_time_ms', 0))
+            if start <= at_ms <= end:
+                return ch.get('type', ch.get('position', ch.get('class_name', 'unknown')))
+        return "unknown"
+
+    def _record_learning_correction(self, action: str, original=None, corrected=None,
+                                     deleted_points=None):
+        """Record a user correction in the learning journal."""
+        journal = self._get_correction_journal()
+        if journal is None:
+            # Auto-create journal if video is loaded
+            video_path = getattr(self.app.file_manager, 'video_path', '')
+            if not video_path:
+                return
+            journal_path = CorrectionJournal.default_path_for_video(video_path)
+            journal = CorrectionJournal(journal_path)
+            journal.video_path = video_path
+            journal.stage2_sqlite_path = getattr(self.app, 's2_sqlite_db_path', '') or ''
+            journal.stage2_msgpack_path = getattr(self.app.file_manager, 'stage2_output_msgpack_path', '') or ''
+            self._correction_journal = journal
+            pm = getattr(self.app, 'project_manager', None)
+            if pm:
+                pm._correction_journal = journal
+
+        chapter_type = "unknown"
+        ref_at = None
+        if corrected:
+            ref_at = corrected.get('at')
+        elif original:
+            ref_at = original.get('at')
+        elif deleted_points:
+            ref_at = deleted_points[0].get('at')
+        if ref_at is not None:
+            chapter_type = self._get_chapter_type_at_time(ref_at)
+
+        entry = CorrectionEntry(
+            action=action,
+            timeline=self.timeline_num,
+            original=original,
+            corrected=corrected,
+            chapter_type=chapter_type,
+            deleted_points=deleted_points,
+        )
+        journal.append(entry)
+
+        # Auto-save periodically (every 10 corrections)
+        if len(journal.corrections) % 10 == 0:
+            try:
+                journal.save()
+            except Exception as e:
+                if self.logger:
+                    self.logger.debug(f"Auto-save correction journal failed: {e}")
+
+    def _accept_all_learning_suggestions(self):
+        """Apply all current learning suggestions to the funscript."""
+        if not self.learning_suggestions or not self.learning_suggestion_actions:
+            return
+
+        fs, axis = self._get_target_funscript_details()
+        if not fs:
+            return
+
+        from funscript.learning.suggestion_engine import SuggestionEngine
+        engine = SuggestionEngine()
+        actions = self._get_actions()
+
+        self.app.funscript_processor._record_timeline_action(
+            self.timeline_num, "Accept Learning Suggestions")
+
+        corrected = engine.apply_suggestions(self.learning_suggestions, actions)
+        fs.set_axis_actions(axis, corrected)
+
+        self.app.funscript_processor._finalize_action_and_update_ui(
+            self.timeline_num, "Accept Learning Suggestions")
+        self.invalidate_cache()
+
+        # Clear suggestions after applying
+        self.learning_suggestion_actions = None
+        self.learning_suggestions = None
+
+        if self.logger:
+            self.logger.info("Applied learning suggestions", extra={"status_message": True})
+
+    # ==================================================================================
     # MISC / UTILS
     # ==================================================================================
-    
+
     def _update_ultimate_autotune_preview(self):
         if not self.show_ultimate_autotune_preview:
             self.ultimate_autotune_preview_actions = None
